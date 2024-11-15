@@ -17,6 +17,7 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/davecgh/go-spew/spew"
+	tapfn "github.com/lightninglabs/taproot-assets/fn"
 	"github.com/lightninglabs/taproot-assets/itest"
 	"github.com/lightninglabs/taproot-assets/proof"
 	"github.com/lightninglabs/taproot-assets/rfq"
@@ -42,6 +43,7 @@ import (
 	"github.com/lightningnetwork/lnd/macaroons"
 	"github.com/lightningnetwork/lnd/record"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/exp/maps"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/protobuf/proto"
@@ -705,7 +707,7 @@ func sendAssetKeySendPayment(t *testing.T, src, dst *HarnessNode, amt uint64,
 	})
 	require.NoError(t, err)
 
-	result, err := getAssetPaymentResult(stream)
+	result, err := getAssetPaymentResult(stream, false)
 	require.NoError(t, err)
 	require.Equal(t, expectedStatus, result.Status)
 
@@ -784,7 +786,8 @@ func createAndPayNormalInvoice(t *testing.T, src, rfqPeer, dst *HarnessNode,
 	require.NoError(t, err)
 
 	numUnits, _ := payInvoiceWithAssets(
-		t, src, rfqPeer, invoiceResp, assetID, smallShards,
+		t, src, rfqPeer, invoiceResp.PaymentRequest, assetID, smallShards,
+		fn.None[lnrpc.Payment_PaymentStatus](),
 	)
 
 	return numUnits
@@ -849,8 +852,9 @@ func payInvoiceWithSatoshiLastHop(t *testing.T, payer *HarnessNode,
 }
 
 func payInvoiceWithAssets(t *testing.T, payer, rfqPeer *HarnessNode,
-	invoice *lnrpc.AddInvoiceResponse, assetID []byte,
-	smallShards bool) (uint64, rfqmath.BigIntFixedPoint) {
+	payReq string, assetID []byte, smallShards bool,
+	expectedPayStatus fn.Option[lnrpc.Payment_PaymentStatus]) (uint64,
+	rfqmath.BigIntFixedPoint) {
 
 	ctxb := context.Background()
 	ctxt, cancel := context.WithTimeout(ctxb, defaultTimeout)
@@ -859,12 +863,12 @@ func payInvoiceWithAssets(t *testing.T, payer, rfqPeer *HarnessNode,
 	payerTapd := newTapClient(t, payer)
 
 	decodedInvoice, err := payer.DecodePayReq(ctxt, &lnrpc.PayReqString{
-		PayReq: invoice.PaymentRequest,
+		PayReq: payReq,
 	})
 	require.NoError(t, err)
 
 	sendReq := &routerrpc.SendPaymentRequest{
-		PaymentRequest: invoice.PaymentRequest,
+		PaymentRequest: payReq,
 		TimeoutSeconds: int32(PaymentTimeout.Seconds()),
 		FeeLimitMsat:   1_000_000,
 	}
@@ -904,9 +908,11 @@ func payInvoiceWithAssets(t *testing.T, payer, rfqPeer *HarnessNode,
 		"with SCID %d", numUnits, msatPerUnit, peerPubKey,
 		acceptedQuote.Scid)
 
-	result, err := getAssetPaymentResult(stream)
+	expectedStatus := expectedPayStatus.UnwrapOr(lnrpc.Payment_SUCCEEDED)
+
+	result, err := getAssetPaymentResult(stream, expectedPayStatus.IsSome())
 	require.NoError(t, err)
-	require.Equal(t, lnrpc.Payment_SUCCEEDED, result.Status)
+	require.Equal(t, expectedStatus, result.Status)
 
 	return numUnits, *rate
 }
@@ -1055,6 +1061,74 @@ func assertPaymentHtlcAssets(t *testing.T, node *HarnessNode, payHash []byte,
 
 	// Due to rounding we allow up to 1 unit of error.
 	require.InDelta(t, assetAmount, totalAssetAmount, 1)
+}
+
+type assetHodlInvoice struct {
+	preimage lntypes.Preimage
+	payReq   string
+}
+
+func createAssetHodlInvoice(t *testing.T, dstRfqPeer, dst *HarnessNode,
+	assetAmount uint64, assetID []byte) assetHodlInvoice {
+
+	ctxb := context.Background()
+	ctxt, cancel := context.WithTimeout(ctxb, defaultTimeout)
+	defer cancel()
+
+	timeoutSeconds := int64(rfq.DefaultInvoiceExpiry.Seconds())
+
+	t.Logf("Asking peer %x for quote to buy assets to receive for "+
+		"invoice over %d units; waiting up to %ds",
+		dstRfqPeer.PubKey[:], assetAmount, timeoutSeconds)
+
+	dstTapd := newTapClient(t, dst)
+
+	// As this is a hodl invoice, we'll also need to create a preimage external
+	// to lnd.
+	var preimage lntypes.Preimage
+	_, err := rand.Read(preimage[:])
+	require.NoError(t, err)
+
+	payHash := preimage.Hash()
+
+	resp, err := dstTapd.AddInvoice(ctxt, &tchrpc.AddInvoiceRequest{
+		AssetId:     assetID,
+		AssetAmount: assetAmount,
+		PeerPubkey:  dstRfqPeer.PubKey[:],
+		InvoiceRequest: &lnrpc.Invoice{
+			Memo: fmt.Sprintf("this is an asset invoice over "+
+				"%d units", assetAmount),
+			Expiry: timeoutSeconds,
+		},
+		HodlInvoice: &tchrpc.HodlInvoice{
+			PaymentHash: payHash[:],
+		},
+	})
+	require.NoError(t, err)
+
+	decodedInvoice, err := dst.DecodePayReq(ctxt, &lnrpc.PayReqString{
+		PayReq: resp.InvoiceResult.PaymentRequest,
+	})
+	require.NoError(t, err)
+
+	rpcRate := resp.AcceptedBuyQuote.AskAssetRate
+	rate, err := rfqrpc.UnmarshalFixedPoint(rpcRate)
+	require.NoError(t, err)
+
+	assetUnits := rfqmath.NewBigIntFixedPoint(assetAmount, 0)
+	numMSats := rfqmath.UnitsToMilliSatoshi(assetUnits, *rate)
+	mSatPerUnit := float64(decodedInvoice.NumMsat) / float64(assetAmount)
+
+	require.EqualValues(t, uint64(numMSats), uint64(decodedInvoice.NumMsat))
+
+	t.Logf("Got quote for %d sats at %v msat/unit from peer %x with SCID "+
+		"%d", decodedInvoice.NumMsat, mSatPerUnit, dstRfqPeer.PubKey[:],
+		resp.AcceptedBuyQuote.Scid)
+
+	return assetHodlInvoice{
+		preimage: preimage,
+		payReq:   resp.InvoiceResult.PaymentRequest,
+	}
 }
 
 func waitForSendEvent(t *testing.T,
@@ -1576,6 +1650,70 @@ func assertAssetBalance(t *testing.T, client *tapClient, assetID []byte,
 
 		t.Logf("Failed to assert expected balance of %d, current "+
 			"assets: %v", expectedBalance, toProtoJSON(t, r))
+
+		utxos, err3 := client.ListUtxos(ctxb, &taprpc.ListUtxosRequest{})
+		require.NoError(t, err3)
+
+		t.Logf("Current UTXOs: %v", toProtoJSON(t, utxos))
+
+		t.Fatalf("Failed to assert balance: %v", err)
+	}
+}
+
+// assertSpendableBalance differs from assertAssetBalance in that it asserts
+// that the entire balance is spendable. We consider something spendable if we
+// have a local script key for it.
+func assertSpendableBalance(t *testing.T, client *tapClient, assetID []byte,
+	expectedBalance uint64) {
+
+	t.Helper()
+
+	ctxb := context.Background()
+	ctxt, cancel := context.WithTimeout(ctxb, shortTimeout)
+	defer cancel()
+
+	err := wait.NoError(func() error {
+		utxos, err := client.ListUtxos(ctxt, &taprpc.ListUtxosRequest{})
+		if err != nil {
+			return err
+		}
+
+		assets := tapfn.FlatMap(
+			maps.Values(utxos.ManagedUtxos),
+			func(utxo *taprpc.ManagedUtxo) []*taprpc.Asset {
+				return utxo.Assets
+			},
+		)
+
+		relevantAssets := fn.Filter(func(utxo *taprpc.Asset) bool {
+			return bytes.Equal(utxo.AssetGenesis.AssetId, assetID)
+		}, assets)
+
+		var assetSum uint64
+		for _, asset := range relevantAssets {
+			if asset.ScriptKeyIsLocal {
+				assetSum += asset.Amount
+			}
+		}
+
+		if assetSum != expectedBalance {
+			return fmt.Errorf("expected balance %d, got %d", expectedBalance, assetSum)
+		}
+
+		return nil
+	}, shortTimeout)
+	if err != nil {
+		r, err2 := client.ListAssets(ctxb, &taprpc.ListAssetRequest{})
+		require.NoError(t, err2)
+
+		t.Logf("Failed to assert expected balance of %d, current "+
+			"assets: %v", expectedBalance, toProtoJSON(t, r))
+
+		utxos, err3 := client.ListUtxos(ctxb, &taprpc.ListUtxosRequest{})
+		require.NoError(t, err3)
+
+		t.Logf("Current UTXOs: %v", toProtoJSON(t, utxos))
+
 		t.Fatalf("Failed to assert balance: %v", err)
 	}
 }

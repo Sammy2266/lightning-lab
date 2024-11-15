@@ -49,6 +49,10 @@ var allTestCases = []*testCase{
 		test: testCustomChannelsLiquidityEdgeCases,
 	},
 	{
+		name: "test custom channels htlc success",
+		test: testCustomChannelsHtlcSuccess,
+	},
+	{
 		name: "test custom channels balance consistency",
 		test: testCustomChannelsBalanceConsistency,
 	},
